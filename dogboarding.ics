@@ -1,0 +1,115 @@
+"""
+Convert dog boarding CSV (exported from your xlsx) into a Google-Calendar-ready
+.ics file. Each dog slot on each date becomes ONE all-day event, with a UID
+based on (date, slot number) -- NOT the dog's name. That's the key to avoiding
+duplicates: if you regenerate this file after updating the sheet, Google
+Calendar matches events by UID and updates them in place instead of adding
+new copies, even if which dog occupies "slot 3" on a given day changes.
+
+Usage:
+    python3 csv_to_ics.py input.csv output.ics
+"""
+import csv
+import sys
+import re
+from datetime import datetime, date
+from icalendar import Calendar, Event
+import uuid as uuidlib
+
+UID_DOMAIN = "dogcal.local"  # doesn't need to resolve, just needs to be stable/unique to you
+
+def clean(s):
+    return (s or "").strip()
+
+def parse_date(s):
+    s = clean(s)
+    m = re.match(r"^\d{4}-\d{2}-\d{2}$", s)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+def convert(input_path, output_path):
+    cal = Calendar()
+    cal.add("prodid", "-//Dog Boarding Calendar//dogcal.local//")
+    cal.add("version", "2.0")
+    cal.add("X-WR-CALNAME", "Dog Boarding")
+
+    event_count = 0
+    skipped_dupe_dates = []
+
+    with open(input_path, newline="", encoding="utf-8-sig", errors="replace") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    header = rows[0]
+    data_rows = rows[1:]
+
+    seen_dates = {}
+
+    for row in data_rows:
+        if not row or len(row) < 3:
+            continue
+        d = parse_date(row[0])
+        if d is None:
+            continue  # blank/spacer row or malformed date
+
+        if d in seen_dates:
+            skipped_dupe_dates.append((d.isoformat(), seen_dates[d]))
+        seen_dates[d] = seen_dates.get(d, 0) + 1
+
+        # 12 dog blocks of 3 columns each, starting at column index 3
+        for slot in range(12):
+            base = 3 + slot * 3
+            if base + 2 >= len(row):
+                break
+            dog_name = clean(row[base])
+            time_field = clean(row[base + 1])
+            notes_field = clean(row[base + 2])
+
+            if not dog_name:
+                continue  # empty slot that day
+
+            ev = Event()
+            ev.add("summary", dog_name)
+            ev.add("dtstart", d)
+            # all-day event: dtend = next day per iCal spec, icalendar handles
+            # this automatically when dtstart is a date object and no dtend given
+            # but some clients want an explicit dtend; add it for safety
+            from datetime import timedelta
+            ev.add("dtend", d + timedelta(days=1))
+
+            desc_parts = []
+            if time_field:
+                desc_parts.append(f"Time: {time_field}")
+            if notes_field:
+                desc_parts.append(f"Notes: {notes_field}")
+            if desc_parts:
+                ev.add("description", " | ".join(desc_parts))
+
+            # STABLE UID: date + slot number. This is what prevents duplicates.
+            uid = f"{d.isoformat()}-slot{slot+1}@{UID_DOMAIN}"
+            ev["uid"] = uid
+            ev.add("dtstamp", datetime.now())
+
+            cal.add_component(ev)
+            event_count += 1
+
+    with open(output_path, "wb") as f:
+        f.write(cal.to_ical())
+
+    print(f"Wrote {event_count} events to {output_path}")
+    if skipped_dupe_dates:
+        print("\nWARNING: found duplicate date rows in your CSV (same date appears more than once):")
+        for dt, n in skipped_dupe_dates:
+            print(f"  {dt} (already seen {n} time(s) before this)")
+        print("Both rows were converted -- if they list different dogs, you'll get overlapping")
+        print("slot events for that date. Worth checking your sheet for that date.")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python3 csv_to_ics.py input.csv output.ics")
+        sys.exit(1)
+    convert(sys.argv[1], sys.argv[2])
